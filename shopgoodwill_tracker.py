@@ -1,13 +1,4 @@
 #!/usr/bin/env python3
-"""ShopGoodwill auction tracker.
-
-Polls shopgoodwill.com for auctions matching configured search terms
-(default: Harley-Davidson shirts) and fires a Discord webhook notification
-when a matching auction is about to end (default: 5 minutes out).
-
-No login required — this uses ShopGoodwill's public search API.
-"""
-
 from __future__ import annotations
 
 import json
@@ -22,22 +13,14 @@ from zoneinfo import ZoneInfo
 
 import requests
 
-# --------------------------------------------------------------------------- #
-# Configuration
-# --------------------------------------------------------------------------- #
-
 API_URL = "https://buyerapi.shopgoodwill.com/api/Search/ItemListing"
 ITEM_URL = "https://shopgoodwill.com/item/{item_id}"
 
-# ShopGoodwill returns auction end times as naive ISO strings in US/Pacific.
 SG_TZ = ZoneInfo("America/Los_Angeles")
 
 HERE = Path(__file__).resolve().parent
 STATE_FILE = HERE / "state.json"
 
-# Each entry is one search. `title_must_include` is an extra client-side filter
-# (case-insensitive, all words must appear in the title) applied on top of the
-# server-side keyword search, so you can be as strict as you like.
 DEFAULT_SEARCHES = [
     {
         "search_text": "harley davidson shirt",
@@ -55,8 +38,6 @@ def env(name: str, default: Optional[str] = None) -> Optional[str]:
 
 
 def float_env(name: str, default: float) -> float:
-    """Read a float from the environment, falling back (with a warning) on
-    missing or non-numeric values instead of crashing at import time."""
     raw = env(name)
     if raw is None:
         return default
@@ -68,26 +49,12 @@ def float_env(name: str, default: float) -> float:
 
 
 WEBHOOK_URL = env("DISCORD_WEBHOOK_URL")
-# How far before end-of-auction to alert (minutes).
 LEAD_MINUTES = float_env("LEAD_MINUTES", 5.0)
-# How wide the alert window is. If we poll every POLL_SECONDS, we alert once an
-# auction's remaining time drops to <= LEAD_MINUTES (and > 0).
 POLL_SECONDS = float_env("POLL_SECONDS", 60.0)
-# Ignore auctions ending further out than this to keep the working set small.
 HORIZON_HOURS = float_env("HORIZON_HOURS", 24.0)
 
 
-# --------------------------------------------------------------------------- #
-# Search API
-# --------------------------------------------------------------------------- #
-
 def build_query(search_text: str, page: int = 1, page_size: int = 40) -> Dict[str, Any]:
-    """Build the ItemListing POST body. All fields have server defaults;
-    we send the full template so the request is stable across API tweaks.
-
-    sortColumn=1 + sortDescending=false sorts by time remaining ascending,
-    i.e. ending-soonest first.
-    """
     return {
         "isSize": False,
         "isWeddingCatagory": "false",
@@ -151,17 +118,6 @@ def _fetch_page(search_text: str, session: requests.Session,
 def fetch_items(search_text: str, session: requests.Session,
                 horizon: Optional[datetime] = None,
                 page_size: int = 40, max_pages: int = 25) -> List[Dict[str, Any]]:
-    """Return raw item dicts for a search term, ending-soonest first.
-
-    Paginates so that a busy category with more than one page of auctions
-    ending soon is fully covered. Because results are sorted ascending by end
-    time, we stop as soon as a page's last item ends beyond `horizon` (all
-    later items end even later), and cap at `max_pages` as a safety bound.
-
-    NOTE: the API caps a page at 40 items regardless of the requested
-    pageSize, so page_size must stay at 40 for the "short page = last page"
-    check below to be correct.
-    """
     all_items: List[Dict[str, Any]] = []
     for page in range(1, max_pages + 1):
         items = _fetch_page(search_text, session, page, page_size)
@@ -169,25 +125,18 @@ def fetch_items(search_text: str, session: requests.Session,
             break
         all_items.extend(items)
         if len(items) < page_size:
-            break  # last page
+            break
         if horizon is not None:
             last_end = parse_end_time(items[-1].get("endTime") or "")
             if last_end is not None and last_end > horizon:
-                break  # everything past here ends beyond the horizon
+                break
     return all_items
 
 
-# --------------------------------------------------------------------------- #
-# Parsing / filtering
-# --------------------------------------------------------------------------- #
-
 def parse_end_time(raw: str) -> Optional[datetime]:
-    """Parse ShopGoodwill endTime (naive Pacific) into an aware UTC datetime."""
     if not raw:
         return None
     text = raw.strip().replace("Z", "")
-    # Trim fractional seconds to 6 digits max (strptime/%f and fromisoformat
-    # reject more), so an over-precise timestamp still parses.
     if "." in text:
         head, _, frac = text.partition(".")
         text = f"{head}.{frac[:6]}" if frac[:6].isdigit() else head
@@ -225,8 +174,6 @@ def normalize(item: Dict[str, Any], required: List[str]) -> Optional[Dict[str, A
     if price is None:
         price = item.get("minimumBid", "?")
     img = item.get("imageUrl") or item.get("imageURL") or ""
-    # ShopGoodwill returns image paths with literal backslashes, which
-    # Discord's server-side embed fetcher will not load — normalize to slashes.
     img = img.replace("\\", "/")
     if img and not img.startswith("http"):
         img = "https://shopgoodwill.com/" + img.lstrip("/")
@@ -240,10 +187,6 @@ def normalize(item: Dict[str, Any], required: List[str]) -> Optional[Dict[str, A
     }
 
 
-# --------------------------------------------------------------------------- #
-# State (so we alert each auction only once)
-# --------------------------------------------------------------------------- #
-
 def load_state() -> Dict[str, Any]:
     if STATE_FILE.exists():
         try:
@@ -254,17 +197,12 @@ def load_state() -> Dict[str, Any]:
 
 
 def save_state(state: Dict[str, Any]) -> None:
-    # Prune alerts we set more than a day ago to keep the file small.
     cutoff = (datetime.now(timezone.utc) - timedelta(days=1)).timestamp()
     state["alerted"] = {
         k: v for k, v in state.get("alerted", {}).items() if v > cutoff
     }
     STATE_FILE.write_text(json.dumps(state, indent=2))
 
-
-# --------------------------------------------------------------------------- #
-# Discord
-# --------------------------------------------------------------------------- #
 
 def send_discord(item: Dict[str, Any], minutes_left: float) -> bool:
     if not WEBHOOK_URL:
@@ -295,10 +233,6 @@ def send_discord(item: Dict[str, Any], minutes_left: float) -> bool:
         log.error("Discord webhook failed: %s", exc)
         return False
 
-
-# --------------------------------------------------------------------------- #
-# Main loop
-# --------------------------------------------------------------------------- #
 
 def run_once(searches: List[Dict[str, Any]], state: Dict[str, Any],
              session: requests.Session) -> None:
@@ -366,7 +300,7 @@ def main() -> int:
     while True:
         try:
             run_once(searches, state, session)
-        except Exception:  # noqa: BLE001 - keep the daemon alive
+        except Exception:
             log.exception("Unexpected error during poll; continuing.")
         if once:
             return 0
